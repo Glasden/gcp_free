@@ -15,7 +15,7 @@ except ImportError:
     print("pip install google-cloud-compute google-cloud-resource-manager")
     sys.exit(1)
 
-GITHUB_REPO = "fatekey/gcp_free"
+GITHUB_REPO = "Glasden/gcp_free"
 GITHUB_BRANCH = "master"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
 GITHUB_RAW_SCRIPTS_BASE = f"{GITHUB_RAW_BASE}/scripts"
@@ -25,6 +25,11 @@ REMOTE_SCRIPT_URLS = {
     "net_iptables": f"{GITHUB_RAW_SCRIPTS_BASE}/net_iptables.sh",
     "net_shutdown": f"{GITHUB_RAW_SCRIPTS_BASE}/net_shutdown.sh",
 }
+
+REQUIRED_SERVICES = [
+    "cloudresourcemanager.googleapis.com",
+    "compute.googleapis.com",
+]
 FIREWALL_RULES_TO_CLEAN = [
     "allow-all-ingress-custom",
     "deny-cdn-egress-custom",
@@ -55,6 +60,57 @@ def print_success(msg):
 def print_warning(msg):
     print(f"\033[93m[警告] {msg}\033[0m")
     sys.stdout.flush()
+
+
+def ensure_project_apis(project_id):
+    """为选中的项目启用必需 API，并等待 Compute Engine API 可用。"""
+    if shutil.which("gcloud") is None:
+        print_warning("未找到 gcloud，无法为目标项目启用所需 API。")
+        return False
+
+    print_info(f"正在为项目 {project_id} 启用所需的 GCP API...")
+    cmd = [
+        "gcloud",
+        "services",
+        "enable",
+        *REQUIRED_SERVICES,
+        "--project",
+        project_id,
+        "--quiet",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        print_warning(f"启用 GCP API 失败: {detail or '未知错误'}")
+        return False
+
+    print_success("所需 GCP API 已启用。")
+    print_info("正在等待 Compute Engine API 生效...")
+
+    probe_cmd = [
+        "gcloud",
+        "compute",
+        "zones",
+        "list",
+        "--project",
+        project_id,
+        "--limit=1",
+        "--format=value(name)",
+    ]
+    deadline = time.time() + 90
+    last_error = ""
+    while time.time() < deadline:
+        probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if probe.returncode == 0:
+            print_success("Compute Engine API 已就绪。")
+            return True
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        time.sleep(5)
+
+    print_warning("等待 Compute Engine API 生效超时，请稍后重新运行脚本。")
+    if last_error:
+        print_warning(f"最后一次检查结果: {last_error}")
+    return False
 
 
 def select_from_list(items, prompt_text, label_fn):
@@ -90,16 +146,23 @@ def select_gcp_project():
             if project.state == resourcemanager_v3.Project.State.ACTIVE:
                 active_projects.append(project)
 
+        active_projects.sort(key=lambda p: (p.display_name or "", p.project_id or ""))
+
         if not active_projects:
-            print_warning("未找到活跃的项目。请手动输入项目 ID。")
+            print_warning("未找到活跃的项目。新建项目可能尚未同步到搜索索引。")
             return prompt_manual_project_id()
 
         print("\n--- 请选择目标项目 ---")
-        for i, p in enumerate(active_projects):
-            print(f"[{i+1}] {p.project_id} ({p.display_name})")
+        for i, p in enumerate(active_projects, start=1):
+            print(f"[{i}] {p.project_id} ({p.display_name})")
+        print("[0] 手动输入 Project ID（适用于刚创建、尚未出现在列表中的项目）")
 
         while True:
-            choice = input(f"请输入数字选择 (1-{len(active_projects)}): ").strip()
+            choice = input(f"请输入数字选择 (0-{len(active_projects)}): ").strip()
+            if choice == "0":
+                project_id = prompt_manual_project_id()
+                print_info(f"将使用手动输入的项目: {project_id}")
+                return project_id
             if choice.isdigit():
                 idx = int(choice) - 1
                 if 0 <= idx < len(active_projects):
@@ -133,12 +196,13 @@ def select_zone(project_id):
     try:
         zones = list_zones_for_region(project_id, region)
     except Exception as e:
-        print_warning(f"获取可用区失败: {e}。将使用默认可用区 {default_zone}。")
-        return default_zone
+        print_warning(f"获取可用区失败: {e}")
+        print_warning("不会自动使用默认可用区；请确认 Compute Engine API 已启用并稍后重试。")
+        return None
 
     if not zones:
-        print_warning(f"未获取到可用区列表，使用默认可用区 {default_zone}。")
-        return default_zone
+        print_warning(f"未获取到 {region} 的可用区列表，请稍后重试。")
+        return None
 
     return select_from_list(zones, f"请选择可用区 ({region})", lambda z: z)
 
@@ -763,6 +827,10 @@ def deploy_dae_config(project_id, instance_info, remote_config):
 def main():
     print("GCP 免费服务器多功能管理工具")
     project_id = select_gcp_project()
+    if not ensure_project_apis(project_id):
+        print_warning("目标项目初始化失败，已停止运行。")
+        return
+
     current_instance = None
     remote_config = None
 
@@ -788,6 +856,8 @@ def main():
 
         if choice == "1":
             zone = select_zone(project_id)
+            if not zone:
+                continue
             os_config = select_os_image()
             create_instance(project_id, zone, os_config)
         elif choice == "2":
